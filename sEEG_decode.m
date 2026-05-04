@@ -1,8 +1,8 @@
 %% sEEG_decode.m
 % =========================================================================
 % Purpose:  sEEG (stereoelectroencephalography) binary decoding pipeline.
-%           Performs LDA classification with combinatorial segment removal,
-%           per-fold downsampling, leave-one-segment-out cross-validation,
+%           Performs LDA classification with leave-one-segment-out (LOSO)
+%           cross-validation, cost-sensitive learning (uniform priors),
 %           and segment-level permutation testing.
 %
 % Author:   [Your Name]
@@ -156,31 +156,6 @@ nClass1_seg = sum(segmentLabels == 1);
 fprintf('Class balance (segments): class 0 = %d, class 1 = %d\n', ...
     nClass0_seg, nClass1_seg);
 
-%% ===== ENUMERATE BALANCED COMBINATIONS ==================================
-% Identify majority class (9 segments) and minority class (6 segments)
-if nClass0_seg > nClass1_seg
-    majorityLabel = 0;
-else
-    majorityLabel = 1;
-end
-
-majoritySegIdx = find(segmentLabels == majorityLabel);  % indices into uniqueSegments
-
-% Five fixed groups of 3 consecutive segment IDs
-allGroups = {[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]};%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
-% Keep only groups where all 3 segments belong to the majority class
-removalCombos = zeros(0, 2);%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-for g = 1:numel(allGroups)
-    groupIDs = allGroups{g};
-    groupIdx = find(ismember(uniqueSegments, groupIDs));
-    if all(ismember(groupIdx, majoritySegIdx))
-        removalCombos = [removalCombos; groupIdx(:)'];
-    end
-end
-nCombos = size(removalCombos, 1);
-fprintf('Number of balanced removal combinations: %d\n', nCombos);
-
 %% ===== SET UP PARALLEL POOL =============================================
 fprintf('Setting up parallel pool with %d workers...\n', nCores);
 currentPool = gcp('nocreate');
@@ -197,8 +172,8 @@ else
     parpool('local', nCores);
 end
 
-%% ===== OBSERVED LOSO CV ACROSS COMBINATIONS =============================
-fprintf('\nRunning observed LOSO CV across %d combinations...\n', nCombos);
+%% ===== LOSO CV (ALL 10 SEGMENTS) ========================================
+fprintf('\nRunning observed LOSO CV across %d segments...\n', nSegments);
 
 % Pre-build per-segment index arrays
 segIndices = cell(nSegments, 1);
@@ -206,130 +181,81 @@ for s = 1:nSegments
     segIndices{s} = find(session_id == uniqueSegments(s));
 end
 
-% Storage for per-combination results
-comboAccuracies         = zeros(nCombos, 1);
-comboBalancedAccuracies = zeros(nCombos, 1);
-comboSensitivities      = zeros(nCombos, 1);
-comboSpecificities      = zeros(nCombos, 1);
-comboAUCs               = zeros(nCombos, 1);
-comboAllCoeffs          = zeros(nCombos, 8, nFeatures);  % nCombos x 12folds x nFeatures%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Storage for per-fold results
+foldAccuracies         = zeros(nSegments, 1);
+foldBalancedAccuracies = zeros(nSegments, 1);
+foldSensitivities      = zeros(nSegments, 1);
+foldSpecificities      = zeros(nSegments, 1);
+foldAUCs               = zeros(nSegments, 1);
+foldCoeffs             = zeros(nSegments, nFeatures);
 
-for c = 1:nCombos
-    removeSegIdx = removalCombos(c, :);  % 3 indices into uniqueSegments
-    removeSegIDs = uniqueSegments(removeSegIdx);
+% Collect per-observation predictions and posteriors (each obs appears in exactly one test fold)
+allPredictions = NaN(nObservations, 1);
+allPosteriors  = NaN(nObservations, 1);
 
-    % Build mask: keep observations NOT in removed segments
-    keepMask = ~ismember(session_id, removeSegIDs);
-    X_combo = X(keepMask, :);
-    y_combo = binaryLabels(keepMask);
-    sid_combo = session_id(keepMask);
+for k = 1:nSegments
+    testSegID = uniqueSegments(k);
+    testMask  = (session_id == testSegID);
+    trainMask = ~testMask;
 
-    % Remaining 12 segments
-    remainingSegIdx = setdiff(1:nSegments, removeSegIdx);
-    remainingSegIDs = uniqueSegments(remainingSegIdx);
-    nRemainingSegs = numel(remainingSegIDs);
+    X_train = X(trainMask, :);
+    y_train = binaryLabels(trainMask);
+    X_test  = X(testMask, :);
+    y_test  = binaryLabels(testMask);
 
-    % Preallocate for this combination
-    comboPredictions = NaN(size(y_combo));
-    comboPosteriors  = NaN(size(y_combo));
-    comboFoldCoeffs  = zeros(nRemainingSegs, nFeatures);
+    % Cost-sensitive LDA: uniform priors balance each class's influence on the
+    % decision boundary regardless of the (imbalanced) training class counts.
+    mdl = fitcdiscr(X_train, y_train, 'Prior', 'uniform');
 
-    for k = 1:nRemainingSegs
-        testSegID = remainingSegIDs(k);
-        testMask_c  = (sid_combo == testSegID);
-        trainMask_c = ~testMask_c;
+    [yPred, posteriorProbs] = predict(mdl, X_test);
 
-        X_train_raw = X_combo(trainMask_c, :);
-        y_train_raw = y_combo(trainMask_c);
-        X_test_c    = X_combo(testMask_c, :);
-
-        % Per-fold downsampling: equalize training class observation counts
-        idx0 = find(y_train_raw == 0);
-        idx1 = find(y_train_raw == 1);
-        n0_train = numel(idx0);
-        n1_train = numel(idx1);
-
-        if n0_train > n1_train
-            % Downsample class 0 to match class 1
-            keepIdx0 = idx0(randperm(n0_train, n1_train));
-            trainIdx = sort([keepIdx0; idx1]);
-        elseif n1_train > n0_train
-            % Downsample class 1 to match class 0
-            keepIdx1 = idx1(randperm(n1_train, n0_train));
-            trainIdx = sort([idx0; keepIdx1]);
-        else
-            trainIdx = (1:numel(y_train_raw))';
-        end
-
-        X_train = X_train_raw(trainIdx, :);
-        y_train = y_train_raw(trainIdx);
-
-        % Train plain LDA (no cost matrix, default priors)
-        mdl = fitcdiscr(X_train, y_train);
-
-        % Predict on held-out segment
-        [yPred, posteriorProbs] = predict(mdl, X_test_c);
-
-        class1Idx = find(mdl.ClassNames == 1);
-        if isempty(class1Idx)
-            error('Class 1 not found in model ClassNames for combo %d, fold %d.', c, k);
-        end
-        posteriorClass1 = posteriorProbs(:, class1Idx);
-
-        % Store pooled predictions
-        comboPredictions(testMask_c) = yPred;
-        comboPosteriors(testMask_c)  = posteriorClass1;
-
-        % Store LDA coefficients
-        comboFoldCoeffs(k, :) = mdl.Coeffs(1, 2).Linear';
+    class1Idx = find(mdl.ClassNames == 1);
+    if isempty(class1Idx)
+        error('Class 1 not found in model ClassNames for fold %d.', k);
     end
+    posteriorClass1 = posteriorProbs(:, class1Idx);
 
-    % Compute metrics for this combination
-    trueLabels_c = y_combo;
-    TP_c = sum(comboPredictions == 1 & trueLabels_c == 1);
-    TN_c = sum(comboPredictions == 0 & trueLabels_c == 0);
-    FP_c = sum(comboPredictions == 1 & trueLabels_c == 0);
-    FN_c = sum(comboPredictions == 0 & trueLabels_c == 1);
+    allPredictions(testMask) = yPred;
+    allPosteriors(testMask)  = posteriorClass1;
 
-    sens_c = TP_c / max(TP_c + FN_c, 1);
-    spec_c = TN_c / max(TN_c + FP_c, 1);
+    % Per-fold metrics
+    TP_k = sum(yPred == 1 & y_test == 1);
+    TN_k = sum(yPred == 0 & y_test == 0);
+    FP_k = sum(yPred == 1 & y_test == 0);
+    FN_k = sum(yPred == 0 & y_test == 1);
 
-    comboAccuracies(c)         = (TP_c + TN_c) / numel(trueLabels_c);
-    comboBalancedAccuracies(c) = (sens_c + spec_c) / 2;
-    comboSensitivities(c)      = sens_c;
-    comboSpecificities(c)      = spec_c;
+    sens_k = TP_k / max(TP_k + FN_k, 1);
+    spec_k = TN_k / max(TN_k + FP_k, 1);
+
+    foldAccuracies(k)         = (TP_k + TN_k) / numel(y_test);
+    foldBalancedAccuracies(k) = (sens_k + spec_k) / 2;
+    foldSensitivities(k)      = sens_k;
+    foldSpecificities(k)      = spec_k;
 
     try
-        [~, ~, ~, auc_c] = perfcurve(trueLabels_c, comboPosteriors, 1);
-        comboAUCs(c) = auc_c;
+        [~, ~, ~, auc_k] = perfcurve(y_test, posteriorClass1, 1);
+        foldAUCs(k) = auc_k;
     catch
-        comboAUCs(c) = NaN;
+        foldAUCs(k) = NaN;
     end
 
-    comboAllCoeffs(c, :, :) = comboFoldCoeffs;
-    
-    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%     fprintf('  Combination %d/%d: removed segments [%d %d %d], BA=%.4f, AUC=%.4f\n', ...
-%         c, nCombos, removeSegIDs(1), removeSegIDs(2), removeSegIDs(3), ...
-%         comboBalancedAccuracies(c), comboAUCs(c));
-    fprintf('  Combination %d/%d: removed segments [%d %d], BA=%.4f, AUC=%.4f\n', ...
-        c, nCombos, removeSegIDs(1), removeSegIDs(2), ...
-        comboBalancedAccuracies(c), comboAUCs(c));%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    foldCoeffs(k, :) = mdl.Coeffs(1, 2).Linear';
 
+    fprintf('  Fold %d/%d: held-out segment %d, BA=%.4f, AUC=%.4f\n', ...
+        k, nSegments, testSegID, foldBalancedAccuracies(k), foldAUCs(k));
 end
 
-%% ===== AGGREGATE OBSERVED METRICS ACROSS COMBINATIONS ===================
-fprintf('\nAggregating observed metrics across %d combinations...\n', nCombos);
+%% ===== AGGREGATE OBSERVED METRICS ACROSS FOLDS ==========================
+fprintf('\nAggregating observed metrics across %d folds...\n', nSegments);
 
-obsAccuracy         = mean(comboAccuracies);
-obsBalancedAccuracy = mean(comboBalancedAccuracies);
-obsSensitivity      = mean(comboSensitivities);
-obsSpecificity      = mean(comboSpecificities);
-obsAUC              = nanmean(comboAUCs);
+obsAccuracy         = mean(foldAccuracies);
+obsBalancedAccuracy = mean(foldBalancedAccuracies);
+obsSensitivity      = mean(foldSensitivities);
+obsSpecificity      = mean(foldSpecificities);
+obsAUC              = nanmean(foldAUCs);
 
-% Aggregate feature weights: mean across all combinations and folds
-allCoeffs = reshape(comboAllCoeffs, [], nFeatures);  % (nCombos*12) x nFeatures
-rawWeights = mean(allCoeffs, 1);  % 1 x nFeatures
+% Aggregate feature weights: mean across all folds
+rawWeights = mean(foldCoeffs, 1);  % 1 x nFeatures
 maxAbsWeight = max(abs(rawWeights));
 if maxAbsWeight == 0
     scaledWeights = zeros(size(rawWeights));
@@ -343,65 +269,9 @@ fprintf('  Sensitivity:       %.4f\n', obsSensitivity);
 fprintf('  Specificity:       %.4f\n', obsSpecificity);
 fprintf('  AUC:               %.4f\n', obsAUC);
 
-%% ===== COLLECT POOLED POSTERIORS FOR ROC CURVE ==========================
-% Accumulate per-observation posteriors across all combinations.
-% Each observation may appear in multiple combinations (those that did NOT
-% remove its segment), so we average the posteriors across those combos.
-
-allComboPosteriorsFull = NaN(nObservations, nCombos);
-
-for c = 1:nCombos
-    removeSegIDs_c = uniqueSegments(removalCombos(c, :));
-    keepMask_c     = ~ismember(session_id, removeSegIDs_c);
-
-    X_c   = X(keepMask_c, :);
-    y_c   = binaryLabels(keepMask_c);
-    sid_c = session_id(keepMask_c);
-
-    remainSegIDs_c = uniqueSegments(setdiff(1:nSegments, removalCombos(c, :)));
-    nRemain_c      = numel(remainSegIDs_c);
-
-    posteriors_c = NaN(sum(keepMask_c), 1);
-
-    for k = 1:nRemain_c
-        testSID  = remainSegIDs_c(k);
-        tMask    = (sid_c == testSID);
-        trMask   = ~tMask;
-
-        y_tr     = y_c(trMask);
-        X_tr_raw = X_c(trMask, :);
-        X_te     = X_c(tMask, :);
-
-        % Same per-fold downsampling as the observed loop
-        i0 = find(y_tr == 0);  i1 = find(y_tr == 1);
-        n0t = numel(i0);        n1t = numel(i1);
-        if n0t > n1t
-            keep0 = i0(randperm(n0t, n1t));
-            trIdx = sort([keep0; i1]);
-        elseif n1t > n0t
-            keep1 = i1(randperm(n1t, n0t));
-            trIdx = sort([i0; keep1]);
-        else
-            trIdx = (1:n0t+n1t)';
-        end
-
-        mdlR = fitcdiscr(X_tr_raw(trIdx, :), y_tr(trIdx));
-        [~, postR] = predict(mdlR, X_te);
-        c1idx = find(mdlR.ClassNames == 1);
-        if ~isempty(c1idx)
-            posteriors_c(tMask) = postR(:, c1idx);
-        end
-    end
-
-    % Map back into full observation space
-    fullPost = NaN(nObservations, 1);
-    obsInCombo = find(keepMask_c);
-    fullPost(obsInCombo) = posteriors_c;
-    allComboPosteriorsFull(:, c) = fullPost;
-end
-
-% Average posteriors across combinations (ignoring combos that excluded each obs)
-pooledPosteriors = nanmean(allComboPosteriorsFull, 2);  % NaN where obs never appeared
+%% ===== POOLED POSTERIORS FOR ROC CURVE ==================================
+% Each observation is the test set in exactly one LOSO fold — no averaging needed.
+pooledPosteriors = allPosteriors;
 validObsMask     = ~isnan(pooledPosteriors);
 
 % Save into results
@@ -413,7 +283,7 @@ fprintf('Pooled posteriors collected for %d/%d observations.\n', ...
     sum(validObsMask), nObservations);
 
 %% ===== PERMUTATION TESTING ==============================================
-fprintf('\nRunning %d permutations (segment-level label shuffling, combo+downsample)...\n', nPermutations);
+fprintf('\nRunning %d permutations (segment-level label shuffling, LOSO)...\n', nPermutations);
 
 % Broadcast variables for parfor
 X_broadcast = X;
@@ -423,7 +293,6 @@ nSeg_broadcast = nSegments;
 nFeat_broadcast = nFeatures;
 segIndices_broadcast = segIndices;
 segBinaryLabels = segmentLabels;
-allGroups_bc = allGroups;
 
 % Preallocate output arrays
 permBalancedAccuracies = zeros(nPermutations, 1);
@@ -441,112 +310,55 @@ parfor p = 1:nPermutations
         permLabels(segIndices_broadcast{s}) = shuffledSegLabels(s);
     end
 
-    % Re-identify majority class under permuted labels
-    nC0_p = sum(shuffledSegLabels == 0);
-    nC1_p = sum(shuffledSegLabels == 1);
-    if nC0_p > nC1_p
-        majLabel_p = 0;
-    else
-        majLabel_p = 1;
-    end
+    foldBAs_p  = zeros(nSeg_broadcast, 1);
+    foldAUCs_p = zeros(nSeg_broadcast, 1);
 
-    majSegIdx_p = find(shuffledSegLabels == majLabel_p);
+    for k = 1:nSeg_broadcast
+        testSID = uSeg_broadcast(k);
+        tMask   = (sid_broadcast == testSID);
+        trMask  = ~tMask;
 
-    % Re-enumerate removal combos for this permutation
-    permRemovalCombos = zeros(0, 3);
-    for g = 1:numel(allGroups_bc)
-        groupIDs = allGroups_bc{g};
-        groupIdx = find(ismember(uSeg_broadcast, groupIDs));
-        if all(ismember(groupIdx, majSegIdx_p))
-            permRemovalCombos = [permRemovalCombos; groupIdx(:)'];
-        end
-    end
-    nCombos_p = size(permRemovalCombos, 1);
+        y_tr = permLabels(trMask);
+        X_tr = X_broadcast(trMask, :);
+        X_te = X_broadcast(tMask, :);
+        y_te = permLabels(tMask);
 
-    % Handle edge case: if no valid removal group found
-    if nCombos_p == 0
-        permBalancedAccuracies(p) = NaN;
-        permAUCs(p) = NaN;
-        continue;
-    end
-
-    comboBAs_p   = zeros(nCombos_p, 1);
-    comboAUCs_p  = zeros(nCombos_p, 1);
-
-    for cp = 1:nCombos_p
-        removeIdx_p = permRemovalCombos(cp, :);
-        removeIDs_p = uSeg_broadcast(removeIdx_p);
-
-        keepMask_p = ~ismember(sid_broadcast, removeIDs_p);
-        X_c = X_broadcast(keepMask_p, :);
-        y_c = permLabels(keepMask_p);
-        sid_c = sid_broadcast(keepMask_p);
-
-        remainSegs_p = setdiff(uSeg_broadcast, removeIDs_p);
-        nRemain_p = numel(remainSegs_p);
-
-        predAll_p = zeros(size(y_c));
-        postAll_p = zeros(size(y_c));
-
-        for kk = 1:nRemain_p
-            tMask = (sid_c == remainSegs_p(kk));
-            trMask = ~tMask;
-
-            y_tr = y_c(trMask);
-            X_tr = X_c(trMask, :);
-            X_te = X_c(tMask, :);
-
-            % Per-fold downsampling on training data
-            i0 = find(y_tr == 0);
-            i1 = find(y_tr == 1);
-            n0t = numel(i0);
-            n1t = numel(i1);
-
-            if n0t > n1t && n1t > 0
-                keep0 = i0(randperm(n0t, n1t));
-                trIdx = sort([keep0; i1]);
-            elseif n1t > n0t && n0t > 0
-                keep1 = i1(randperm(n1t, n0t));
-                trIdx = sort([i0; keep1]);
-            else
-                trIdx = (1:numel(y_tr))';
-            end
-
-            X_tr_ds = X_tr(trIdx, :);
-            y_tr_ds = y_tr(trIdx);
-
-            % Train plain LDA and predict
-            mdlP = fitcdiscr(X_tr_ds, y_tr_ds);
-            [pred_p, post_p] = predict(mdlP, X_te);
-
-            c1 = find(mdlP.ClassNames == 1);
-            if isempty(c1)
-                postAll_p(tMask) = 0;
-            else
-                postAll_p(tMask) = post_p(:, c1);
-            end
-            predAll_p(tMask) = pred_p;
+        % Skip fold if training set is single-class (can occur under permutation)
+        if numel(unique(y_tr)) < 2
+            foldBAs_p(k)  = NaN;
+            foldAUCs_p(k) = NaN;
+            continue;
         end
 
-        % Compute permutation metrics for this combo
-        tp = sum(predAll_p == 1 & y_c == 1);
-        tn = sum(predAll_p == 0 & y_c == 0);
-        fp = sum(predAll_p == 1 & y_c == 0);
-        fn = sum(predAll_p == 0 & y_c == 1);
+        % Cost-sensitive LDA: uniform priors (mirrors observed CV)
+        mdlP = fitcdiscr(X_tr, y_tr, 'Prior', 'uniform');
+        [pred_p, post_p] = predict(mdlP, X_te);
+
+        c1 = find(mdlP.ClassNames == 1);
+        if isempty(c1)
+            post1 = zeros(size(y_te));
+        else
+            post1 = post_p(:, c1);
+        end
+
+        tp = sum(pred_p == 1 & y_te == 1);
+        tn = sum(pred_p == 0 & y_te == 0);
+        fp = sum(pred_p == 1 & y_te == 0);
+        fn = sum(pred_p == 0 & y_te == 1);
         sens_pp = tp / max(tp + fn, 1);
         spec_pp = tn / max(tn + fp, 1);
-        comboBAs_p(cp) = (sens_pp + spec_pp) / 2;
+        foldBAs_p(k) = (sens_pp + spec_pp) / 2;
 
         try
-            [~, ~, ~, auc_pp] = perfcurve(y_c, postAll_p, 1);
-            comboAUCs_p(cp) = auc_pp;
+            [~, ~, ~, auc_pp] = perfcurve(y_te, post1, 1);
+            foldAUCs_p(k) = auc_pp;
         catch
-            comboAUCs_p(cp) = NaN;
+            foldAUCs_p(k) = NaN;
         end
     end
 
-    permBalancedAccuracies(p) = nanmean(comboBAs_p);
-    permAUCs(p) = nanmean(comboAUCs_p);
+    permBalancedAccuracies(p) = nanmean(foldBAs_p);
+    permAUCs(p) = nanmean(foldAUCs_p);
 
     if mod(p, 100) == 0
         fprintf('  Permutation %d/%d completed.\n', p, nPermutations);
@@ -568,7 +380,7 @@ fprintf('  AUC p-value:               %.4f\n', pValue_AUC);
 %% ===== BUILD RESULTS STRUCTURE ==========================================
 fprintf('\nBuilding results structure...\n');
 
-% Global observed results (aggregated across combinations)
+% Global observed results (aggregated across folds)
 results.observed.accuracy          = obsAccuracy;
 results.observed.balancedAccuracy  = obsBalancedAccuracy;
 results.observed.sensitivity       = obsSensitivity;
@@ -577,15 +389,15 @@ results.observed.AUC               = obsAUC;
 results.observed.featureWeights.raw    = rawWeights;
 results.observed.featureWeights.scaled = scaledWeights;
 
-% Per-combination results
-for c = nCombos:-1:1
-    results.combinations(c).removedSegments    = uniqueSegments(removalCombos(c, :));
-    results.combinations(c).accuracy           = comboAccuracies(c);
-    results.combinations(c).balancedAccuracy   = comboBalancedAccuracies(c);
-    results.combinations(c).sensitivity        = comboSensitivities(c);
-    results.combinations(c).specificity        = comboSpecificities(c);
-    results.combinations(c).AUC                = comboAUCs(c);
-    results.combinations(c).foldCoefficients   = squeeze(comboAllCoeffs(c, :, :));
+% Per-fold results keyed by held-out session_id
+for k = nSegments:-1:1
+    results.folds(k).heldOutSegment  = uniqueSegments(k);
+    results.folds(k).accuracy        = foldAccuracies(k);
+    results.folds(k).balancedAccuracy = foldBalancedAccuracies(k);
+    results.folds(k).sensitivity     = foldSensitivities(k);
+    results.folds(k).specificity     = foldSpecificities(k);
+    results.folds(k).AUC             = foldAUCs(k);
+    results.folds(k).foldCoefficients = foldCoeffs(k, :);
 end
 
 % Permutation results
@@ -606,9 +418,6 @@ results.info.segmentScores     = segmentScores;
 results.info.segmentLabels     = segmentLabels;
 results.info.classBalance.nClass0 = nClass0_seg;
 results.info.classBalance.nClass1 = nClass1_seg;
-results.info.nCombinations     = nCombos;
-results.info.removalGroups     = allGroups;
-results.info.removalCombos     = removalCombos;
 results.info.dateRun           = datestr(now, 'yyyy-mm-dd HH:MM:SS');
 
 %% ===== SAVE RESULTS =====================================================
@@ -619,7 +428,7 @@ save(resultsPath, 'results');
 
 fprintf('\n=== ANALYSIS COMPLETE ===\n');
 fprintf('Results saved to: %s\n', resultsPath);
-fprintf('  Combinations:        %d\n', nCombos);
+fprintf('  Folds:               %d\n', nSegments);
 fprintf('  Accuracy:            %.4f\n', results.observed.accuracy);
 fprintf('  Balanced Accuracy:   %.4f (p = %.4f)\n', ...
     results.observed.balancedAccuracy, pValue_balancedAccuracy);
